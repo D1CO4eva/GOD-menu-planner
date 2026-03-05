@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState } from 'react';
-import { motion, AnimatePresence } from "motion/react";
+import React, { useEffect, useRef, useState } from 'react';
+import { motion, AnimatePresence, Reorder } from "motion/react";
 import { 
   Utensils, 
   Users, 
@@ -16,6 +16,7 @@ import {
   CheckCircle2,
   AlertCircle,
   UserPlus,
+  GripVertical,
   Trash2,
   FileSpreadsheet,
   X
@@ -108,16 +109,6 @@ type ItemEditorState = {
   courseIndex: number;
   itemIndex: number | null;
   draft: MenuItem;
-};
-
-type DragItemState = {
-  courseIndex: number;
-  itemIndex: number;
-};
-
-type DragTargetState = {
-  courseIndex: number;
-  itemIndex: number | null;
 };
 
 const PROGRAM_THEMES: Record<ProgramId, ProgramTheme> = {
@@ -258,6 +249,7 @@ const dedupeAndCapCourses = (courses: MenuCourse[], maxItems: number): MenuCours
 
 const OPENROUTER_MODEL = "openai/gpt-4o-mini";
 const MENU_GENERATION_MAX_TOKENS = 600;
+const MENU_GENERATION_RETRY_MAX_TOKENS = 1100;
 const MENU_CACHE_FETCH_TIMEOUT_MS = 2500;
 const MENU_CACHE_MAX_BLOCKLIST_ITEMS = 120;
 const MENU_API_URL = (
@@ -289,13 +281,23 @@ export default function App() {
   const [volunteers, setVolunteers] = useState<Record<string, string>>({});
   const [itemEditor, setItemEditor] = useState<ItemEditorState | null>(null);
   const [itemEditorError, setItemEditorError] = useState<string | null>(null);
-  const [draggedItem, setDraggedItem] = useState<DragItemState | null>(null);
-  const [dragOverTarget, setDragOverTarget] = useState<DragTargetState | null>(null);
+  const [dragHoverCourseIndex, setDragHoverCourseIndex] = useState<number | null>(null);
+  const itemKeyMapRef = useRef(new WeakMap<MenuItem, string>());
+  const itemKeyCounterRef = useRef(0);
+  const courseDropZoneRefs = useRef<Array<HTMLElement | null>>([]);
+  const activeDragItemRef = useRef<{ itemKey: string; fromCourseIndex: number } | null>(null);
   const parsedPeopleCount = Number.parseInt(peopleInput, 10);
   const peopleCount = Number.isNaN(parsedPeopleCount) ? 0 : parsedPeopleCount;
   const selectedProgram = PROGRAM_TEMPLATES.find((program) => program.id === selectedProgramId) || null;
   const activeCuisine = selectedProgramId ? PROGRAM_THEMES[selectedProgramId] : DEFAULT_THEME;
   const defaultTrayMeasurement = selectedProgram ? PROGRAM_TRAY_RULES[selectedProgram.id] : "1 Small Tray";
+  const getItemDragKey = (item: MenuItem) => {
+    const existing = itemKeyMapRef.current.get(item);
+    if (existing) return existing;
+    const next = `item-${itemKeyCounterRef.current++}`;
+    itemKeyMapRef.current.set(item, next);
+    return next;
+  };
 
   useEffect(() => {
     const mobileUserAgent = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i;
@@ -502,9 +504,6 @@ export default function App() {
     setItemEditorError(null);
   };
 
-  const isDropTarget = (courseIndex: number, itemIndex: number | null) =>
-    dragOverTarget?.courseIndex === courseIndex && dragOverTarget?.itemIndex === itemIndex;
-
   const moveMenuItem = (
     fromCourseIndex: number,
     fromItemIndex: number,
@@ -546,48 +545,79 @@ export default function App() {
     setItemEditorError(null);
   };
 
-  const parseDraggedItemFromDataTransfer = (event: React.DragEvent): DragItemState | null => {
-    const raw = event.dataTransfer.getData("text/plain");
-    if (!raw || !raw.includes(":")) return null;
-
-    const [coursePart, itemPart] = raw.split(":");
-    const courseIndex = Number.parseInt(coursePart, 10);
-    const itemIndex = Number.parseInt(itemPart, 10);
-    if (Number.isNaN(courseIndex) || Number.isNaN(itemIndex)) return null;
-    return { courseIndex, itemIndex };
+  const reorderCourseItems = (courseIndex: number, nextItems: MenuItem[]) => {
+    setMenu((prev) => {
+      if (!prev) return prev;
+      const nextCourses = prev.courses.map((course, idx) =>
+        idx === courseIndex ? { ...course, items: [...nextItems] } : course
+      );
+      return { ...prev, courses: nextCourses };
+    });
+    setItemEditor(null);
+    setItemEditorError(null);
   };
 
-  const handleItemDragStart =
-    (courseIndex: number, itemIndex: number) => (event: React.DragEvent) => {
-      setDraggedItem({ courseIndex, itemIndex });
-      event.dataTransfer.effectAllowed = "move";
-      event.dataTransfer.setData("text/plain", `${courseIndex}:${itemIndex}`);
-    };
-
-  const handleItemDragEnd = () => {
-    setDraggedItem(null);
-    setDragOverTarget(null);
+  const moveMenuItemToCourse = (fromCourseIndex: number, fromItemIndex: number, toCourseIndex: number) => {
+    if (fromCourseIndex === toCourseIndex) return;
+    moveMenuItem(fromCourseIndex, fromItemIndex, toCourseIndex, null);
   };
 
-  const handleItemDragOver =
-    (courseIndex: number, itemIndex: number | null) => (event: React.DragEvent) => {
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "move";
-      if (!isDropTarget(courseIndex, itemIndex)) {
-        setDragOverTarget({ courseIndex, itemIndex });
+  const getCourseIndexFromPoint = (x: number, y: number): number | null => {
+    if (!menu) return null;
+    for (let courseIndex = 0; courseIndex < menu.courses.length; courseIndex += 1) {
+      const element = courseDropZoneRefs.current[courseIndex];
+      if (!element) continue;
+      const rect = element.getBoundingClientRect();
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+        return courseIndex;
       }
-    };
+    }
+    return null;
+  };
 
-  const handleItemDrop =
-    (toCourseIndex: number, toItemIndex: number | null) => (event: React.DragEvent) => {
-      event.preventDefault();
-      const source = draggedItem || parseDraggedItemFromDataTransfer(event);
-      setDragOverTarget(null);
-      if (!source) return;
+  const findItemPositionByKey = (itemKey: string) => {
+    if (!menu) return null;
+    for (let courseIndex = 0; courseIndex < menu.courses.length; courseIndex += 1) {
+      const course = menu.courses[courseIndex];
+      for (let itemIndex = 0; itemIndex < course.items.length; itemIndex += 1) {
+        if (getItemDragKey(course.items[itemIndex]) === itemKey) {
+          return { courseIndex, itemIndex };
+        }
+      }
+    }
+    return null;
+  };
 
-      moveMenuItem(source.courseIndex, source.itemIndex, toCourseIndex, toItemIndex);
-      setDraggedItem(null);
+  const handleReorderDragStart = (courseIndex: number, item: MenuItem) => () => {
+    activeDragItemRef.current = {
+      itemKey: getItemDragKey(item),
+      fromCourseIndex: courseIndex,
     };
+    setDragHoverCourseIndex(courseIndex);
+  };
+
+  const handleReorderDrag = (_event: MouseEvent | TouchEvent | PointerEvent, info: any) => {
+    if (!info?.point) return;
+    const targetCourseIndex = getCourseIndexFromPoint(info.point.x, info.point.y);
+    setDragHoverCourseIndex(targetCourseIndex);
+  };
+
+  const handleReorderDragEnd = (_event: MouseEvent | TouchEvent | PointerEvent, info: any) => {
+    const activeDrag = activeDragItemRef.current;
+    activeDragItemRef.current = null;
+
+    const targetCourseIndex =
+      info?.point ? getCourseIndexFromPoint(info.point.x, info.point.y) : null;
+    setDragHoverCourseIndex(null);
+
+    if (!activeDrag || targetCourseIndex === null || targetCourseIndex === activeDrag.fromCourseIndex) {
+      return;
+    }
+
+    const livePosition = findItemPositionByKey(activeDrag.itemKey);
+    if (!livePosition) return;
+    moveMenuItemToCourse(livePosition.courseIndex, livePosition.itemIndex, targetCourseIndex);
+  };
 
   const handleVolunteerSignup = (itemName: string, name: string) => {
     setVolunteers(prev => ({ ...prev, [itemName]: name }));
@@ -911,63 +941,86 @@ export default function App() {
         throw new Error("Generate API endpoint is not configured.");
       }
 
-      let data: any = null;
-      let lastFailureMessage = "Unknown error";
-      for (const endpoint of generateEndpoints) {
-        try {
-          const response = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              model: OPENROUTER_MODEL,
-              temperature: 0.15,
-              max_tokens: MENU_GENERATION_MAX_TOKENS,
-              response_format: { type: "json_object" },
-              messages: [
-                {
-                  role: "system",
-                  content:
-                    "Return only valid JSON with this exact shape: {\"title\":string,\"cuisine\":string,\"groupSize\":number,\"preferences\":string[],\"courses\":[{\"category\":string,\"items\":[{\"name\":string,\"description\":string,\"estimatedQuantity\":string,\"trayMeasurement\":string}]}],\"tips\":string[]}. No markdown. Keep descriptions short and practical.",
-                },
-                { role: "user", content: prompt },
-              ],
-            }),
-          });
+      const requestCompletion = async (maxTokens: number, userPrompt: string) => {
+        let completionData: any = null;
+        let failureMessage = "Unknown error";
 
-          const responseText = await response.text();
-          if (!response.ok) {
-            const summary = responseText.slice(0, 220).replace(/\s+/g, " ").trim();
-            lastFailureMessage = `${response.status}${summary ? ` ${summary}` : ""}`;
-            continue;
-          }
-
+        for (const endpoint of generateEndpoints) {
           try {
-            data = JSON.parse(responseText);
-            break;
-          } catch {
-            lastFailureMessage = "Generate endpoint returned non-JSON content.";
+            const response = await fetch(endpoint, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                model: OPENROUTER_MODEL,
+                temperature: 0.15,
+                max_tokens: maxTokens,
+                response_format: { type: "json_object" },
+                messages: [
+                  {
+                    role: "system",
+                    content:
+                      "Return only valid JSON with this exact shape: {\"title\":string,\"cuisine\":string,\"groupSize\":number,\"preferences\":string[],\"courses\":[{\"category\":string,\"items\":[{\"name\":string,\"description\":string,\"estimatedQuantity\":string,\"trayMeasurement\":string}]}],\"tips\":string[]}. No markdown. Keep descriptions short and practical.",
+                  },
+                  { role: "user", content: userPrompt },
+                ],
+              }),
+            });
+
+            const responseText = await response.text();
+            if (!response.ok) {
+              const summary = responseText.slice(0, 220).replace(/\s+/g, " ").trim();
+              failureMessage = `${response.status}${summary ? ` ${summary}` : ""}`;
+              continue;
+            }
+
+            try {
+              completionData = JSON.parse(responseText);
+              break;
+            } catch {
+              failureMessage = "Generate endpoint returned non-JSON content.";
+            }
+          } catch (innerErr) {
+            failureMessage =
+              innerErr instanceof Error ? innerErr.message : "Network request failed";
           }
-        } catch (innerErr) {
-          lastFailureMessage =
-            innerErr instanceof Error ? innerErr.message : "Network request failed";
+        }
+
+        return { completionData, failureMessage };
+      };
+
+      const parseCompletionMenuJson = (completion: any) => {
+        const rawContent = completion?.choices?.[0]?.message?.content;
+        const content =
+          typeof rawContent === "string"
+            ? rawContent
+            : Array.isArray(rawContent)
+              ? rawContent.map((part) => (typeof part === "string" ? part : part?.text || "")).join("\n")
+              : "";
+        return JSON.parse(extractJsonObject(content));
+      };
+
+      const firstAttempt = await requestCompletion(MENU_GENERATION_MAX_TOKENS, prompt);
+      if (!firstAttempt.completionData) {
+        throw new Error(`Generate request failed: ${firstAttempt.failureMessage}`);
+      }
+
+      let parsed: any;
+      try {
+        parsed = parseCompletionMenuJson(firstAttempt.completionData);
+      } catch {
+        const retryPrompt = `${prompt}\n\nIMPORTANT: Return complete and valid JSON only. Do not truncate output.`;
+        const retryAttempt = await requestCompletion(MENU_GENERATION_RETRY_MAX_TOKENS, retryPrompt);
+        if (!retryAttempt.completionData) {
+          throw new Error(`Generate request failed: ${retryAttempt.failureMessage}`);
+        }
+        try {
+          parsed = parseCompletionMenuJson(retryAttempt.completionData);
+        } catch {
+          throw new Error("Model returned invalid JSON. Please generate again.");
         }
       }
-
-      if (!data) {
-        throw new Error(`Generate request failed: ${lastFailureMessage}`);
-      }
-
-      const rawContent = data?.choices?.[0]?.message?.content;
-      const content =
-        typeof rawContent === "string"
-          ? rawContent
-          : Array.isArray(rawContent)
-            ? rawContent.map((part) => (typeof part === "string" ? part : part?.text || "")).join("\n")
-            : "";
-
-      const parsed = JSON.parse(extractJsonObject(content));
       const normalizedCourses = Array.isArray(parsed?.courses)
         ? parsed.courses.map((course: any) => ({
             category: typeof course?.category === "string" ? course.category : "Course",
@@ -1387,7 +1440,16 @@ export default function App() {
                   {/* Menu Content */}
                   <div className="p-4 sm:p-8 space-y-8 sm:space-y-12">
                     {menu.courses.map((course, idx) => (
-                      <section key={idx} className="space-y-6">
+                      <section
+                        key={idx}
+                        ref={(element) => {
+                          courseDropZoneRefs.current[idx] = element;
+                        }}
+                        className={cn(
+                          "space-y-6 rounded-2xl transition-all",
+                          dragHoverCourseIndex === idx && "bg-[#2E3192]/5 ring-1 ring-[#2E3192]/25 p-3 -m-3"
+                        )}
+                      >
                         <div className="flex items-center gap-4">
                           <h3 className={cn("text-xs font-bold uppercase tracking-[0.3em] whitespace-nowrap", activeCuisine.text)}>
                             {course.category}
@@ -1468,136 +1530,94 @@ export default function App() {
                           </div>
                         )}
 
-                        {isMobileDevice ? (
-                          <div className="space-y-3">
-                            {course.items.map((item, iIdx) => (
-                              <article
-                                key={iIdx}
-                                draggable
-                                onDragStart={handleItemDragStart(idx, iIdx)}
-                                onDragEnd={handleItemDragEnd}
-                                onDragOver={handleItemDragOver(idx, iIdx)}
-                                onDrop={handleItemDrop(idx, iIdx)}
-                                className={cn(
-                                  "rounded-2xl border border-black/10 bg-white p-4 space-y-3 shadow-sm cursor-move",
-                                  isDropTarget(idx, iIdx) && "border-[#2E3192] bg-[#2E3192]/5"
-                                )}
-                              >
-                                <div>
-                                  <h4 className="font-bold text-base text-[#2E3192] mb-1">{item.name}</h4>
-                                  <p className="text-sm text-black/50 leading-relaxed">{item.description}</p>
-                                </div>
-
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <span className={cn("text-xs font-bold px-2 py-1 rounded-md inline-block", activeCuisine.light, activeCuisine.text)}>
-                                    {item.trayMeasurement}
-                                  </span>
-                                  <span className="text-[11px] font-mono text-black/40">({item.estimatedQuantity})</span>
-                                </div>
-
-                                <div className="space-y-2">
-                                  <p className="text-[10px] uppercase tracking-widest font-bold text-black/40">Volunteer</p>
-                                  {renderVolunteerControl(item.name, true)}
-                                </div>
-
-                                <div className="flex items-center gap-2 pt-1">
-                                  <button
-                                    onClick={() => openEditItemEditor(idx, iIdx)}
-                                    className="px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-md border border-[#2E3192]/25 text-[#2E3192] hover:bg-[#2E3192]/5 transition-colors"
-                                  >
-                                    Edit
-                                  </button>
-                                  <button
-                                    onClick={() => deleteMenuItem(idx, iIdx)}
-                                    className="px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-md border border-red-300 text-red-600 hover:bg-red-50 transition-colors"
-                                  >
-                                    Delete
-                                  </button>
-                                </div>
-                              </article>
-                            ))}
-                            <div
-                              onDragOver={handleItemDragOver(idx, null)}
-                              onDrop={handleItemDrop(idx, null)}
-                              className={cn(
-                                "rounded-xl border border-dashed border-black/15 px-3 py-2 text-[11px] uppercase tracking-wider font-bold text-black/35 text-center",
-                                isDropTarget(idx, null) && "border-[#2E3192] text-[#2E3192] bg-[#2E3192]/5"
-                              )}
+                        <Reorder.Group
+                          axis="y"
+                          values={course.items}
+                          onReorder={(nextItems) => reorderCourseItems(idx, nextItems)}
+                          className="space-y-3"
+                        >
+                          {course.items.map((item, iIdx) => (
+                            <Reorder.Item
+                              key={getItemDragKey(item)}
+                              value={item}
+                              className="rounded-2xl border border-black/10 bg-white p-4 sm:p-5 shadow-sm cursor-grab active:cursor-grabbing"
+                              whileDrag={{ scale: 1.01, boxShadow: "0 20px 40px rgba(15,23,42,0.12)" }}
+                              transition={{ duration: 0.18 }}
+                              onDragStart={handleReorderDragStart(idx, item)}
+                              onDrag={handleReorderDrag}
+                              onDragEnd={handleReorderDragEnd}
                             >
-                              Drop Here To Move Item To End Of {course.category}
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="overflow-x-auto">
-                            <table className="w-full text-left border-collapse">
-                              <thead>
-                                <tr className="border-b border-black/5">
-                                  <th className="py-4 px-4 text-[10px] uppercase font-bold tracking-wider text-black/40">Dish Name</th>
-                                  <th className="py-4 px-4 text-[10px] uppercase font-bold tracking-wider text-black/40">Quantity / Tray</th>
-                                  <th className="py-4 px-4 text-[10px] uppercase font-bold tracking-wider text-black/40">Volunteer</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {course.items.map((item, iIdx) => (
-                                  <tr
-                                    key={iIdx}
-                                    draggable
-                                    onDragStart={handleItemDragStart(idx, iIdx)}
-                                    onDragEnd={handleItemDragEnd}
-                                    onDragOver={handleItemDragOver(idx, iIdx)}
-                                    onDrop={handleItemDrop(idx, iIdx)}
-                                    className={cn(
-                                      "group border-b border-black/5 hover:bg-black/[0.01] transition-colors cursor-move",
-                                      isDropTarget(idx, iIdx) && "bg-[#2E3192]/5"
-                                    )}
-                                  >
-                                    <td className="py-6 px-4">
-                                      <div className="font-bold text-lg mb-1 group-hover:text-[#2E3192] transition-colors">{item.name}</div>
-                                      <p className="text-sm text-black/40 leading-relaxed max-w-xs">{item.description}</p>
-                                      <div className="flex items-center gap-2 mt-3">
-                                        <button
-                                          onClick={() => openEditItemEditor(idx, iIdx)}
-                                          className="px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-md border border-[#2E3192]/25 text-[#2E3192] hover:bg-[#2E3192]/5 transition-colors"
-                                        >
-                                          Edit
-                                        </button>
-                                        <button
-                                          onClick={() => deleteMenuItem(idx, iIdx)}
-                                          className="px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-md border border-red-300 text-red-600 hover:bg-red-50 transition-colors"
-                                        >
-                                          Delete
-                                        </button>
-                                      </div>
-                                    </td>
-                                    <td className="py-6 px-4">
-                                      <div className="flex flex-col gap-1">
-                                        <span className={cn("text-xs font-bold px-2 py-1 rounded-md inline-block w-fit", activeCuisine.light, activeCuisine.text)}>
-                                          {item.trayMeasurement}
-                                        </span>
-                                        <span className="text-[10px] font-mono text-black/30">
-                                          ({item.estimatedQuantity})
-                                        </span>
-                                      </div>
-                                    </td>
-                                    <td className="py-6 px-4">
-                                      {renderVolunteerControl(item.name)}
-                                    </td>
-                                  </tr>
-                                ))}
-                                <tr
-                                  onDragOver={handleItemDragOver(idx, null)}
-                                  onDrop={handleItemDrop(idx, null)}
-                                  className={cn(
-                                    "border-b border-black/5",
-                                    isDropTarget(idx, null) && "bg-[#2E3192]/5"
-                                  )}
-                                >
-                                  <td colSpan={3} className="py-3 px-4 text-[10px] uppercase tracking-wider font-bold text-black/35">
-                                    Drop Here To Move Item To End Of {course.category}
-                                  </td>
-                                </tr>
-                              </tbody>
-                            </table>
+                              <div className="flex items-start gap-3">
+                                <div className="mt-1 text-black/30">
+                                  <GripVertical className="w-4 h-4" />
+                                </div>
+                                <div className="flex-1 min-w-0 space-y-3">
+                                  <div>
+                                    <h4 className="font-bold text-base sm:text-lg text-[#2E3192] mb-1">{item.name}</h4>
+                                    <p className="text-sm text-black/50 leading-relaxed">{item.description}</p>
+                                  </div>
+
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className={cn("text-xs font-bold px-2 py-1 rounded-md inline-block", activeCuisine.light, activeCuisine.text)}>
+                                      {item.trayMeasurement}
+                                    </span>
+                                    <span className="text-[11px] font-mono text-black/40">({item.estimatedQuantity})</span>
+                                  </div>
+
+                                  <div className="space-y-2">
+                                    <p className="text-[10px] uppercase tracking-widest font-bold text-black/40">Volunteer</p>
+                                    {renderVolunteerControl(item.name, true)}
+                                  </div>
+
+                                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                                    <button
+                                      onClick={() => openEditItemEditor(idx, iIdx)}
+                                      className="px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-md border border-[#2E3192]/25 text-[#2E3192] hover:bg-[#2E3192]/5 transition-colors"
+                                    >
+                                      Edit
+                                    </button>
+                                    <button
+                                      onClick={() => deleteMenuItem(idx, iIdx)}
+                                      className="px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-md border border-red-300 text-red-600 hover:bg-red-50 transition-colors"
+                                    >
+                                      Delete
+                                    </button>
+                                    <select
+                                      defaultValue=""
+                                      onChange={(e) => {
+                                        const targetCourseIndex = Number.parseInt(e.target.value, 10);
+                                        if (Number.isNaN(targetCourseIndex)) return;
+                                        moveMenuItemToCourse(idx, iIdx, targetCourseIndex);
+                                        e.currentTarget.value = "";
+                                      }}
+                                      className="px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-md border border-black/15 text-black/60 bg-white hover:bg-black/[0.02] transition-colors"
+                                    >
+                                      <option value="">Move to section...</option>
+                                      {menu?.courses.map((targetCourse, targetIdx) => (
+                                        targetIdx === idx ? null : (
+                                          <option key={`${targetCourse.category}-${targetIdx}`} value={targetIdx}>
+                                            {targetCourse.category}
+                                          </option>
+                                        )
+                                      ))}
+                                    </select>
+                                  </div>
+                                </div>
+                              </div>
+                            </Reorder.Item>
+                          ))}
+                        </Reorder.Group>
+
+                        {course.items.length === 0 && (
+                          <div
+                            className={cn(
+                              "rounded-2xl border-2 border-dashed border-black/15 bg-white/70 min-h-[88px] flex items-center justify-center px-4 text-center",
+                              dragHoverCourseIndex === idx && "border-[#2E3192]/40 bg-[#2E3192]/5"
+                            )}
+                          >
+                            <p className="text-[11px] uppercase tracking-wider font-bold text-black/35">
+                              Drag a dish here to move it into {course.category}
+                            </p>
                           </div>
                         )}
                       </section>
