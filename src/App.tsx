@@ -256,16 +256,15 @@ const dedupeAndCapCourses = (courses: MenuCourse[], maxItems: number): MenuCours
   return next.filter((course) => course.items.length > 0);
 };
 
-const OPENROUTER_API_KEY = "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";
 const OPENROUTER_MODEL = "openai/gpt-4o-mini";
-const MENU_GENERATION_TIMEOUT_MS = 6000;
-const MENU_GENERATION_MAX_TOKENS = 900;
+const MENU_GENERATION_MAX_TOKENS = 600;
 const MENU_CACHE_FETCH_TIMEOUT_MS = 2500;
 const MENU_CACHE_MAX_BLOCKLIST_ITEMS = 120;
 const MENU_API_URL = (
   import.meta.env.VITE_MENU_API_URL ||
   "https://god-auth-service-693007788010.us-central1.run.app/api/menu"
 ).trim();
+const MENU_GENERATE_API_URL = (import.meta.env.VITE_MENU_GENERATE_API_URL || "").trim();
 
 const normalizeDishNameForMatch = (value: string) =>
   value
@@ -778,6 +777,35 @@ export default function App() {
     }
   };
 
+  const getGenerateEndpointCandidates = () => {
+    const candidates: string[] = [];
+    const pushCandidate = (value: string) => {
+      const normalized = value.trim().replace(/\/+$/, "");
+      if (!normalized) return;
+      candidates.push(normalized);
+    };
+
+    if (MENU_GENERATE_API_URL) {
+      pushCandidate(MENU_GENERATE_API_URL);
+    }
+
+    if (MENU_API_URL) {
+      const normalizedMenuApiUrl = MENU_API_URL.trim().replace(/\/+$/, "");
+      const authBase = normalizedMenuApiUrl
+        .replace(/\/api\/menu$/i, "")
+        .replace(/\/menu$/i, "");
+
+      pushCandidate(`${authBase}/generate`);
+      pushCandidate(`${authBase}/api/generate`);
+      pushCandidate(normalizedMenuApiUrl.replace(/\/api\/menu$/i, "/generate"));
+      pushCandidate(normalizedMenuApiUrl.replace(/\/api\/menu$/i, "/api/generate"));
+      pushCandidate(normalizedMenuApiUrl.replace(/\/menu$/i, "/generate"));
+      pushCandidate(normalizedMenuApiUrl.replace(/\/menu$/i, "/api/generate"));
+    }
+
+    return Array.from(new Set(candidates.map((url) => url.trim()).filter(Boolean)));
+  };
+
   const addCustomRestriction = () => {
     const trimmed = newRestrictionInput.trim();
     if (!trimmed || customRestrictions.includes(trimmed)) return;
@@ -878,18 +906,19 @@ export default function App() {
           
           Also provide 3-4 professional tips for managing this specific menu for a large group.`;
 
-      const controller = new AbortController();
-      const timeoutId = window.setTimeout(() => controller.abort(), MENU_GENERATION_TIMEOUT_MS);
-      const response = await (async () => {
+      const generateEndpoints = getGenerateEndpointCandidates();
+      if (generateEndpoints.length === 0) {
+        throw new Error("Generate API endpoint is not configured.");
+      }
+
+      let data: any = null;
+      let lastFailureMessage = "Unknown error";
+      for (const endpoint of generateEndpoints) {
         try {
-          return await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          const response = await fetch(endpoint, {
             method: "POST",
-            signal: controller.signal,
             headers: {
               "Content-Type": "application/json",
-              Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-              "HTTP-Referer": window.location.origin,
-              "X-Title": "Bhojan Planner",
             },
             body: JSON.stringify({
               model: OPENROUTER_MODEL,
@@ -906,17 +935,30 @@ export default function App() {
               ],
             }),
           });
-        } finally {
-          window.clearTimeout(timeoutId);
-        }
-      })();
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`OpenRouter request failed: ${response.status} ${errorText}`);
+          const responseText = await response.text();
+          if (!response.ok) {
+            const summary = responseText.slice(0, 220).replace(/\s+/g, " ").trim();
+            lastFailureMessage = `${response.status}${summary ? ` ${summary}` : ""}`;
+            continue;
+          }
+
+          try {
+            data = JSON.parse(responseText);
+            break;
+          } catch {
+            lastFailureMessage = "Generate endpoint returned non-JSON content.";
+          }
+        } catch (innerErr) {
+          lastFailureMessage =
+            innerErr instanceof Error ? innerErr.message : "Network request failed";
+        }
       }
 
-      const data = await response.json();
+      if (!data) {
+        throw new Error(`Generate request failed: ${lastFailureMessage}`);
+      }
+
       const rawContent = data?.choices?.[0]?.message?.content;
       const content =
         typeof rawContent === "string"
@@ -970,9 +1012,7 @@ export default function App() {
       setItemEditorError(null);
     } catch (err) {
       console.error(err);
-      if (err instanceof Error && err.name === "AbortError") {
-        setError("Menu generation exceeded 6 seconds. Try again or reduce menu complexity.");
-      } else if (
+      if (
         err instanceof Error &&
         err.message.includes("No unique dishes available after applying menu-cache exclusions")
       ) {
@@ -980,7 +1020,8 @@ export default function App() {
           "Model repeated cached dishes. Try generating again or clear old menu cache entries."
         );
       } else {
-        setError("Failed to generate menu from OpenRouter. Please try again.");
+        const message = err instanceof Error ? err.message : "Failed to generate menu via Auth Service.";
+        setError(message);
       }
     } finally {
       setLoading(false);
