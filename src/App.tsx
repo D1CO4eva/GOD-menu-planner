@@ -43,7 +43,7 @@ const CUISINES = [
   "Thai",
 ];
 
-const MANDATORY_RESTRICTIONS = [
+const DEFAULT_DIETARY_RULES = [
   "Vegetarian only",
   "No onion",
   "No garlic",
@@ -270,6 +270,7 @@ export default function App() {
   const [newCuisineInput, setNewCuisineInput] = useState("");
   const [isMobileDevice, setIsMobileDevice] = useState(false);
   const [peopleInput, setPeopleInput] = useState("10");
+  const [selectedDietaryRules, setSelectedDietaryRules] = useState<string[]>([...DEFAULT_DIETARY_RULES]);
   const [customRestrictions, setCustomRestrictions] = useState<string[]>([]);
   const [newRestrictionInput, setNewRestrictionInput] = useState("");
   const [additionalInstructions, setAdditionalInstructions] = useState("");
@@ -282,6 +283,7 @@ export default function App() {
   const [itemEditor, setItemEditor] = useState<ItemEditorState | null>(null);
   const [itemEditorError, setItemEditorError] = useState<string | null>(null);
   const [dragHoverCourseIndex, setDragHoverCourseIndex] = useState<number | null>(null);
+  const dragHoverCourseIndexRef = useRef<number | null>(null);
   const itemKeyMapRef = useRef(new WeakMap<MenuItem, string>());
   const itemKeyCounterRef = useRef(0);
   const courseDropZoneRefs = useRef<Array<HTMLElement | null>>([]);
@@ -331,6 +333,7 @@ export default function App() {
     setVolunteers({});
     setItemEditor(null);
     setItemEditorError(null);
+    setSelectedDietaryRules([...DEFAULT_DIETARY_RULES]);
     setCustomRestrictions([]);
     setNewRestrictionInput("");
     setNewCuisineInput("");
@@ -364,6 +367,12 @@ export default function App() {
 
   const removeCuisine = (cuisineName: string) => {
     setSelectedCuisines((prev) => prev.filter((cuisine) => cuisine !== cuisineName));
+  };
+
+  const toggleDietaryRule = (rule: string) => {
+    setSelectedDietaryRules((prev) =>
+      prev.includes(rule) ? prev.filter((entry) => entry !== rule) : [...prev, rule]
+    );
   };
 
   const createBlankMenuItem = (): MenuItem => ({
@@ -562,6 +571,11 @@ export default function App() {
     moveMenuItem(fromCourseIndex, fromItemIndex, toCourseIndex, null);
   };
 
+  const setDragHoverCourse = (courseIndex: number | null) => {
+    dragHoverCourseIndexRef.current = courseIndex;
+    setDragHoverCourseIndex(courseIndex);
+  };
+
   const getCourseIndexFromPoint = (x: number, y: number): number | null => {
     if (!menu) return null;
     for (let courseIndex = 0; courseIndex < menu.courses.length; courseIndex += 1) {
@@ -593,13 +607,29 @@ export default function App() {
       itemKey: getItemDragKey(item),
       fromCourseIndex: courseIndex,
     };
-    setDragHoverCourseIndex(courseIndex);
+    setDragHoverCourse(courseIndex);
   };
 
   const handleReorderDrag = (_event: MouseEvent | TouchEvent | PointerEvent, info: any) => {
+    const activeDrag = activeDragItemRef.current;
+    if (!activeDrag) return;
+
+    const draggedElement = document.querySelector<HTMLElement>(
+      `[data-drag-key="${activeDrag.itemKey}"]`
+    );
+
+    if (draggedElement) {
+      const rect = draggedElement.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      const targetCourseIndex = getCourseIndexFromPoint(centerX, centerY);
+      setDragHoverCourse(targetCourseIndex);
+      return;
+    }
+
     if (!info?.point) return;
     const targetCourseIndex = getCourseIndexFromPoint(info.point.x, info.point.y);
-    setDragHoverCourseIndex(targetCourseIndex);
+    setDragHoverCourse(targetCourseIndex);
   };
 
   const handleReorderDragEnd = (_event: MouseEvent | TouchEvent | PointerEvent, info: any) => {
@@ -607,8 +637,12 @@ export default function App() {
     activeDragItemRef.current = null;
 
     const targetCourseIndex =
-      info?.point ? getCourseIndexFromPoint(info.point.x, info.point.y) : null;
-    setDragHoverCourseIndex(null);
+      dragHoverCourseIndexRef.current !== null
+        ? dragHoverCourseIndexRef.current
+        : info?.point
+          ? getCourseIndexFromPoint(info.point.x, info.point.y)
+          : null;
+    setDragHoverCourse(null);
 
     if (!activeDrag || targetCourseIndex === null || targetCourseIndex === activeDrag.fromCourseIndex) {
       return;
@@ -838,7 +872,10 @@ export default function App() {
 
   const addCustomRestriction = () => {
     const trimmed = newRestrictionInput.trim();
-    if (!trimmed || customRestrictions.includes(trimmed)) return;
+    const normalized = trimmed.toLowerCase();
+    const existsInDefaultRules = selectedDietaryRules.some((rule) => rule.toLowerCase() === normalized);
+    const existsInCustomRules = customRestrictions.some((rule) => rule.toLowerCase() === normalized);
+    if (!trimmed || existsInDefaultRules || existsInCustomRules) return;
     setCustomRestrictions((prev) => [...prev, trimmed]);
     setNewRestrictionInput("");
   };
@@ -888,7 +925,13 @@ export default function App() {
     }
     try {
       const finalCuisine = selectedCuisines.join(", ");
-      const allRestrictions = [...MANDATORY_RESTRICTIONS, ...customRestrictions];
+      const allRestrictions = Array.from(
+        new Set(
+          [...selectedDietaryRules, ...customRestrictions]
+            .map((rule) => rule.trim())
+            .filter(Boolean)
+        )
+      );
       const programTrayRule = PROGRAM_TRAY_RULES[selectedProgram.id];
       const itemRange = getMenuItemRange(selectedProgram.id, peopleCount);
       const blockedFoods = await fetchRecentCachedFoods();
@@ -909,7 +952,7 @@ export default function App() {
       const prompt = `Generate a detailed menu plan for a group of ${peopleCount} people.
           Program Type: ${selectedProgram.name}
           Cuisine Mix: ${finalCuisine}
-          Mandatory Dietary Restrictions: ${allRestrictions.join(", ")}
+          Dietary Restrictions (MANDATORY): ${allRestrictions.length > 0 ? allRestrictions.join(", ") : "None specified"}
           Tray Rule (MANDATORY): ${trayRuleInstruction}
           Dish Count Rule (MANDATORY): Return between ${itemRange.minItems} and ${itemRange.maxItems} total dishes across all courses.
           Repetition Rule (MANDATORY): ${blockedFoodsInstruction}
@@ -932,7 +975,7 @@ export default function App() {
           - Estimated raw quantities (e.g., "5kg Paneer")
           - Tray measurements (e.g., "2 Large Trays", "1 Medium Tray", "3 Small Trays") based on standard catering tray sizes.
 
-          NON-NEGOTIABLE: All dishes must be strictly vegetarian, no onion, no garlic, no eggs, no mushrooms, no fish oils, and no cheeses with animal enzymes.
+          NON-NEGOTIABLE: Obey only the Dietary Restrictions listed above. Do not add extra restrictions that were not selected.
           
           Also provide 3-4 professional tips for managing this specific menu for a large group.`;
 
@@ -1280,17 +1323,43 @@ export default function App() {
               {/* Dietary Rules */}
               <div className="space-y-3">
                 <label className="text-xs font-bold uppercase tracking-wider text-black/40 flex items-center gap-2">
-                  <CheckCircle2 className="w-3 h-3" /> Mandatory Dietary Rules
+                  <CheckCircle2 className="w-3 h-3" /> Dietary Rules (Selectable)
                 </label>
-                <div className="flex flex-wrap gap-2">
-                  {MANDATORY_RESTRICTIONS.map((rule) => (
-                    <span
-                      key={rule}
-                      className="inline-flex items-center gap-1 px-3 py-1.5 bg-[#FFCC00]/20 border border-[#FFCC00]/30 text-[#2E3192] rounded-full text-xs font-bold"
-                    >
-                      {rule}
-                    </span>
-                  ))}
+                {selectedDietaryRules.length > 0 && (
+                  <div className="flex flex-wrap gap-2 pt-1">
+                    {selectedDietaryRules.map((rule) => (
+                      <span
+                        key={rule}
+                        className="inline-flex items-center gap-1 px-3 py-1.5 bg-[#FFCC00]/20 border border-[#FFCC00]/30 text-[#2E3192] rounded-full text-xs font-medium"
+                      >
+                        {rule}
+                        <button
+                          onClick={() => toggleDietaryRule(rule)}
+                          className="hover:text-[#242776]"
+                          aria-label={`Remove ${rule}`}
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex gap-2 pt-1">
+                  <input
+                    type="text"
+                    placeholder="Add dietary rule..."
+                    value={newRestrictionInput}
+                    onChange={(e) => setNewRestrictionInput(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && addCustomRestriction()}
+                    className="flex-1 px-4 py-2 rounded-xl border border-black/5 bg-white focus:outline-none focus:ring-2 focus:ring-[#2E3192]/20 focus:border-[#2E3192] transition-all text-sm"
+                  />
+                  <button
+                    onClick={addCustomRestriction}
+                    className="px-4 py-2 bg-[#2E3192] text-white rounded-xl text-sm font-medium hover:bg-[#242776] transition-colors"
+                  >
+                    Add
+                  </button>
                 </div>
 
                 <label className="text-[10px] font-bold uppercase tracking-wider text-black/40 pt-2 block">
@@ -1315,23 +1384,6 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Add Custom Restriction Input */}
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    placeholder="Add restriction..."
-                    value={newRestrictionInput}
-                    onChange={(e) => setNewRestrictionInput(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && addCustomRestriction()}
-                    className="flex-1 px-4 py-2 rounded-xl border border-black/5 bg-white focus:outline-none focus:ring-2 focus:ring-[#2E3192]/20 focus:border-[#2E3192] transition-all text-sm"
-                  />
-                  <button
-                    onClick={addCustomRestriction}
-                    className="px-4 py-2 bg-[#2E3192] text-white rounded-xl text-sm font-medium hover:bg-[#242776] transition-colors"
-                  >
-                    Add
-                  </button>
-                </div>
               </div>
 
               {/* Additional Instructions */}
@@ -1540,6 +1592,7 @@ export default function App() {
                             <Reorder.Item
                               key={getItemDragKey(item)}
                               value={item}
+                              data-drag-key={getItemDragKey(item)}
                               className="rounded-2xl border border-black/10 bg-white p-4 sm:p-5 shadow-sm cursor-grab active:cursor-grabbing"
                               whileDrag={{ scale: 1.01, boxShadow: "0 20px 40px rgba(15,23,42,0.12)" }}
                               transition={{ duration: 0.18 }}
